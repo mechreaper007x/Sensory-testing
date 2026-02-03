@@ -19,6 +19,14 @@ LEFT_BROW_INNER = 107
 RIGHT_BROW_INNER = 336
 LEFT_BROW_OUTER = 70
 RIGHT_BROW_OUTER = 300
+LEFT_FOREHEAD_TOP = 103
+RIGHT_FOREHEAD_TOP = 332
+
+# Eye Landmarks (Iris & Corners)
+LEFT_EYE_INNER = 133
+RIGHT_EYE_INNER = 362
+LEFT_IRIS_CENTER = 468
+RIGHT_IRIS_CENTER = 473
 
 LEFT_EYE_TOP = 159
 LEFT_EYE_BOTTOM = 145
@@ -49,10 +57,23 @@ class ActionUnits:
     AU15: float = 0.0  # Lip Corner Depress (frown)
     AU20: float = 0.0  # Lip Stretch
     AU26: float = 0.0  # Jaw Drop
+    GAZE_X: float = 0.0 # Horizontal Gaze (-1 Left, +1 Right)
+    GAZE_Y: float = 0.0 # Vertical Gaze (-1 Up, +1 Down)
+    AU_FOREHEAD: float = 0.0 # Forehead Compression (Wrinkles)
     
     def to_array(self) -> np.ndarray:
         return np.array([self.AU1, self.AU2, self.AU4, self.AU5, self.AU6,
-                         self.AU9, self.AU12, self.AU15, self.AU20, self.AU26])
+                         self.AU9, self.AU12, self.AU15, self.AU20, self.AU26,
+                         self.GAZE_X, self.GAZE_Y, self.AU_FOREHEAD])
+
+    def to_dict(self) -> Dict[str, float]:
+        return {
+            'AU1': self.AU1, 'AU2': self.AU2, 'AU4': self.AU4,
+            'AU5': self.AU5, 'AU6': self.AU6, 'AU9': self.AU9,
+            'AU12': self.AU12, 'AU15': self.AU15, 'AU20': self.AU20,
+            'AU26': self.AU26, 'GAZE_X': self.GAZE_X, 'GAZE_Y': self.GAZE_Y,
+            'AU_FOREHEAD': self.AU_FOREHEAD
+        }
 
 class StrictAUEstimator:
     def __init__(self, smoothing_factor: float = 0.7):
@@ -132,7 +153,11 @@ class StrictAUEstimator:
             # 16-19
             MOUTH_LEFT, MOUTH_RIGHT, MOUTH_TOP, MOUTH_BOTTOM,
             # 20
-            JAW_BOTTOM
+            JAW_BOTTOM,
+            # 21-24
+            LEFT_EYE_INNER, RIGHT_EYE_INNER, LEFT_IRIS_CENTER, RIGHT_IRIS_CENTER,
+            # 25-26
+            LEFT_FOREHEAD_TOP, RIGHT_FOREHEAD_TOP
         ]
         
         raw_points = np.array([self._get_vec(landmarks, i) for i in indices])
@@ -239,6 +264,32 @@ class StrictAUEstimator:
         jaw_dist = np.linalg.norm(pt[JAW_BOTTOM] - pt[NOSE_ROOT])
         aus.AU26 = (jaw_dist / skull_scale)
         
+        # === GAZE TRACKING (Saccades) ===
+        # Calculate Iris offset from Eye Center
+        # Left Eye
+        l_eye_width = np.linalg.norm(pt[LEFT_EYE_OUTER] - pt[LEFT_EYE_INNER])
+        l_eye_center = (pt[LEFT_EYE_OUTER] + pt[LEFT_EYE_INNER]) / 2.0
+        l_gaze_vec = pt[LEFT_IRIS_CENTER] - l_eye_center
+        
+        # Right Eye
+        r_eye_width = np.linalg.norm(pt[RIGHT_EYE_OUTER] - pt[RIGHT_EYE_INNER])
+        r_eye_center = (pt[RIGHT_EYE_OUTER] + pt[RIGHT_EYE_INNER]) / 2.0
+        r_gaze_vec = pt[RIGHT_IRIS_CENTER] - r_eye_center
+        
+        # Average normalized gaze vector
+        avg_gaze_x = (l_gaze_vec[0]/l_eye_width + r_gaze_vec[0]/r_eye_width) / 2.0
+        avg_gaze_y = (l_gaze_vec[1]/l_eye_width + r_gaze_vec[1]/r_eye_width) / 2.0 # Use width for aspect ratio stability
+        
+        aus.GAZE_X = avg_gaze_x * 10.0 # Scale up for significance
+        aus.GAZE_Y = avg_gaze_y * 10.0
+        
+        # === AU_FOREHEAD: Forehead Compression ===
+        # Distance between Brow Top and Forehead Top.
+        # When brows raise, this distance SHORTENS.
+        l_forehead_h = np.linalg.norm(pt[LEFT_FOREHEAD_TOP] - pt[LEFT_BROW_INNER])
+        r_forehead_h = np.linalg.norm(pt[RIGHT_FOREHEAD_TOP] - pt[RIGHT_BROW_INNER])
+        aus.AU_FOREHEAD = ((l_forehead_h + r_forehead_h) / 2.0) / skull_scale
+        
         return aus
 
     def add_calibration_sample(self, landmarks) -> None:
@@ -255,7 +306,8 @@ class StrictAUEstimator:
             avg = np.mean(arrays, axis=0)
             self.baseline = ActionUnits(
                 AU1=avg[0], AU2=avg[1], AU4=avg[2], AU5=avg[3], AU6=avg[4],
-                AU9=avg[5], AU12=avg[6], AU15=avg[7], AU20=avg[8], AU26=avg[9]
+                AU9=avg[5], AU12=avg[6], AU15=avg[7], AU20=avg[8], AU26=avg[9],
+                GAZE_X=avg[10], GAZE_Y=avg[11], AU_FOREHEAD=avg[12]
             )
         
         self.calibrated = True
@@ -320,5 +372,15 @@ class StrictAUEstimator:
         
         # AU26: Jaw Drop (Larger Dist)
         rel.AU26 = norm(current.AU26 - b.AU26, 0.08)
+        
+        # GAZE: Deviation from Baseline (Staring at camera)
+        # We start with raw delta
+        rel.GAZE_X = norm(abs(current.GAZE_X - b.GAZE_X), 0.1) # 0.1 deviation is significant
+        rel.GAZE_Y = norm(abs(current.GAZE_Y - b.GAZE_Y), 0.1)
+        
+        # AU_FOREHEAD: Compression (Wrinkling)
+        # Current distance < Baseline distance = Wrinkle.
+        # Deviation = Baseline - Current (if Positive, it's compressed)
+        rel.AU_FOREHEAD = norm(b.AU_FOREHEAD - current.AU_FOREHEAD, 0.03) 
         
         return rel

@@ -14,7 +14,7 @@ import numpy as np
 from collections import deque
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
-from action_units import ActionUnits
+from action_units_v2 import ActionUnits
 import time
 
 @dataclass
@@ -38,7 +38,7 @@ class FlashDetector:
     4. Track duration - only 50-500ms qualifies as micro-expression
     """
     
-    AU_NAMES = ['AU1', 'AU2', 'AU4', 'AU5', 'AU6', 'AU9', 'AU12', 'AU15', 'AU20', 'AU26']
+    AU_NAMES = ['AU1', 'AU2', 'AU4', 'AU5', 'AU6', 'AU9', 'AU12', 'AU15', 'AU20', 'AU26', 'GAZE_X', 'GAZE_Y', 'AU_FOREHEAD']
     
     def __init__(
         self,

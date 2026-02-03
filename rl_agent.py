@@ -16,6 +16,8 @@ Logic:
 """
 
 import numpy as np
+import json
+import os
 
 class SensitivityAgent:
     def __init__(
@@ -123,3 +125,32 @@ class SensitivityAgent:
         self.threshold -= decay_rate
         self.threshold = max(self.threshold, self.min_threshold)
         return self.threshold
+
+    def save_state(self, filepath: str) -> None:
+        """Save learned parameters to JSON"""
+        state = {
+            "threshold": self.threshold,
+            "rewards": self.rewards[-100:], # Optimize size
+            "history": self.history[-100:]
+        }
+        try:
+            with open(filepath, 'w') as f:
+                json.dump(state, f)
+        except Exception as e:
+            print(f"Failed to save RL state: {e}")
+
+    def load_state(self, filepath: str) -> bool:
+        """Load learned parameters"""
+        if not os.path.exists(filepath):
+            return False
+        try:
+            with open(filepath, 'r') as f:
+                state = json.load(f)
+            self.threshold = state.get("threshold", self.threshold)
+            self.rewards = state.get("rewards", [])
+            self.history = state.get("history", [])
+            print(f"[RL] Brain Loaded. Sensitivity: {self.threshold:.2f}")
+            return True
+        except Exception as e:
+            print(f"Failed to load RL state: {e}")
+            return False

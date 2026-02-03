@@ -40,6 +40,7 @@ DROIDCAM_INDEX = 0
 HAND_FACE_THRESHOLD = 0.15
 DEBUG_MODE = False  # Terminal output
 MICRO_MODE = True   # Enable micro-expression detection
+USE_CNN_CLASSIFIER = True # Enable AffectNet Deep Learning Model
 
 # --- MODEL PATHS ---
 FACE_MODEL_PATH = "face_landmarker.task"
@@ -178,6 +179,8 @@ def main():
     
     # Initialize RL Agent
     rl_agent = SensitivityAgent(initial_threshold=2.0)
+    BRAIN_PATH = "brain.json"
+    rl_agent.load_state(BRAIN_PATH)
     
     # Initialize Async Executor for Classifier
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -378,6 +381,9 @@ def main():
             
             key = cv2.waitKey(5) & 0xFF
             if key == ord('q'):
+                print("\nWait! Saving Brain...")
+                rl_agent.save_state(BRAIN_PATH)
+                print("Brain Saved. Quitting.")
                 break
             elif key == ord('r'):
                 print("\nRecalibrating...")
