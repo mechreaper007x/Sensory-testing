@@ -43,7 +43,7 @@ class EmotionClassifier:
     """
     
     # Direct download link for the AffectNet-trained EfficientNet-B0 model
-    MODEL_URL = "https://github.com/av-savchenko/hsemotion-onnx/raw/main/demo/enet_b0_8_best_vgaf.onnx"
+    MODEL_URL = "https://github.com/HSE-asavchenko/face-emotion-recognition/raw/main/models/affectnet_emotions/enet_b0_8_best_vgaf.onnx"
     MODEL_PATH = "enet_b0_8_best_vgaf.onnx"
     
     # AffectNet labels (8 classes)

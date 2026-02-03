@@ -47,14 +47,15 @@ JAW_BOTTOM = 152
 
 @dataclass
 class ActionUnits:
-    AU1: float = 0.0   # Inner Brow Raise
+    AU1: float = 0.0   # Inner Brow Raise (Sadness Tilt)
     AU2: float = 0.0   # Outer Brow Raise
-    AU4: float = 0.0   # Brow Lowerer (frown)
+    AU4: float = 0.0   # Brow Lowerer (Frown)
     AU5: float = 0.0   # Upper Lid Raise
-    AU6: float = 0.0   # Cheek Raise (smile)
+    AU6: float = 0.0   # Cheek Raise (Duchenne)
     AU9: float = 0.0   # Nose Wrinkle
-    AU12: float = 0.0  # Lip Corner Pull (smile)
-    AU15: float = 0.0  # Lip Corner Depress (frown)
+    AU10: float = 0.0  # [NEW] Upper Lip Raise (Snarl)
+    AU12: float = 0.0  # Lip Corner Pull (Smile)
+    AU15: float = 0.0  # Lip Corner Depress (Frown)
     AU20: float = 0.0  # Lip Stretch
     AU26: float = 0.0  # Jaw Drop
     GAZE_X: float = 0.0 # Horizontal Gaze (-1 Left, +1 Right)
@@ -63,13 +64,14 @@ class ActionUnits:
     
     def to_array(self) -> np.ndarray:
         return np.array([self.AU1, self.AU2, self.AU4, self.AU5, self.AU6,
-                         self.AU9, self.AU12, self.AU15, self.AU20, self.AU26,
+                         self.AU9, self.AU10, self.AU12, self.AU15, self.AU20, self.AU26,
                          self.GAZE_X, self.GAZE_Y, self.AU_FOREHEAD])
 
     def to_dict(self) -> Dict[str, float]:
         return {
             'AU1': self.AU1, 'AU2': self.AU2, 'AU4': self.AU4,
             'AU5': self.AU5, 'AU6': self.AU6, 'AU9': self.AU9,
+            'AU10': self.AU10,
             'AU12': self.AU12, 'AU15': self.AU15, 'AU20': self.AU20,
             'AU26': self.AU26, 'GAZE_X': self.GAZE_X, 'GAZE_Y': self.GAZE_Y,
             'AU_FOREHEAD': self.AU_FOREHEAD
@@ -195,13 +197,20 @@ class StrictAUEstimator:
         # Raise: Brow Y=0.2. Diff = -0.2.
         # So Raise makes it MORE NEGATIVE.
         # Let's invert signs to make math intuitive.
-        # Height = Eye - Brow (Positive distance).
-        # Raise = Larger Distance.
-        
+        # === AU1: Inner Brow Raise (Sadness Tilt) ===
+        # REFINED: The "Omega" shape. Inner Brow raises HIGHER than Outer Brow.
         l_brow_dist = pt[LEFT_EYE_OUTER][1] - pt[LEFT_BROW_INNER][1]
         r_brow_dist = pt[RIGHT_EYE_OUTER][1] - pt[RIGHT_BROW_INNER][1]
+        raw_raise = ((l_brow_dist + r_brow_dist) / 2.0)
         
-        aus.AU1 = ((l_brow_dist + r_brow_dist) / 2.0) / skull_scale
+        # Calculate Slant: (Inner Y - Outer Y). 
+        # If Inner Y is smaller (higher) than Outer Y, it's a sadness tilt.
+        l_slant = pt[LEFT_BROW_OUTER][1] - pt[LEFT_BROW_INNER][1] 
+        r_slant = pt[RIGHT_BROW_OUTER][1] - pt[RIGHT_BROW_INNER][1]
+        avg_slant = (l_slant + r_slant) / 2.0
+        
+        # Reward slant. If slant is positive (Inner Higher), boost AU1.
+        aus.AU1 = (raw_raise + avg_slant * 0.5) / skull_scale
         
         # === AU2: Outer Brow Raise ===
         l_obrow_dist = pt[LEFT_EYE_OUTER][1] - pt[LEFT_BROW_OUTER][1]  # Using Eye Outer as anchor
@@ -209,12 +218,17 @@ class StrictAUEstimator:
         aus.AU2 = ((l_obrow_dist + r_obrow_dist) / 2.0) / skull_scale
         
         # === AU4: Brow Lowerer (Frown) ===
-        # Distance between inner brows. Rigid Skull Normalization.
+        # 1. Horizontal Squeeze (Corrugator) - Brows coming together
         brow_width = np.linalg.norm(pt[LEFT_BROW_INNER] - pt[RIGHT_BROW_INNER])
-        # Smaller width = Frown.
-        # We want to map standard width (~X) to 0, and Squeezed (~X-d) to 1.
-        # We'll normalize raw ratio here; compute_relative handles the 0-1 mapping.
-        aus.AU4 = brow_width / skull_scale
+        
+        # 2. Vertical Drop (Procerus) - Brows moving down to Nose Root [USER REQUEST]
+        # "Area between eyebrows and nose top"
+        mid_brow = (pt[LEFT_BROW_INNER] + pt[RIGHT_BROW_INNER]) / 2.0
+        procerus_dist = np.linalg.norm(mid_brow - pt[NOSE_ROOT])
+        
+        # Combine: Both metrics DECREASE when frowning.
+        # We sum them to capture both dimensions of the frown.
+        aus.AU4 = (brow_width + procerus_dist * 1.5) / skull_scale
         
         # === AU5: Upper Lid Raise ===
         # Eye opening height.
@@ -223,19 +237,21 @@ class StrictAUEstimator:
         aus.AU5 = ((l_eye_open + r_eye_open) / 2.0) / skull_scale
         
         # === AU6: Cheek Raise ===
-        # Cheek vs Eye Bottom.
-        # Y dist: Eye Bottom (y) - Cheek (y).
-        # Cheek is below eye. Eye Y < Cheek Y. Diff is Negative.
-        # Raise: Cheek y decreases. Diff becomes less negative (approaches 0).
         l_cheek_h = pt[LEFT_CHEEK][1] - pt[LEFT_EYE_BOTTOM][1]
         r_cheek_h = pt[RIGHT_CHEEK][1] - pt[RIGHT_EYE_BOTTOM][1]
         aus.AU6 = -((l_cheek_h + r_cheek_h) / 2.0) / skull_scale
         
         # === AU9: Nose Wrinkle ===
         # Nose Width (scrunching narrows it? or raises wings?)
-        # Let's use distance between nose wings.
         nose_w = np.linalg.norm(pt[NOSE_LEFT] - pt[NOSE_RIGHT])
         aus.AU9 = nose_w / skull_scale
+
+        # === AU10: Upper Lip Raise (Snarl) [NEW] ===
+        # Distance from Nose Tip to Upper Lip Top.
+        # Snarl = This distance SHRINKS drastically.
+        # Better: Use MOUTH_TOP center vs NOSE_TIP
+        center_snarl = np.linalg.norm(pt[NOSE_TIP] - pt[MOUTH_TOP])
+        aus.AU10 = center_snarl / skull_scale
         
         # === AU12: Lip Corner Pull (Smile) ===
         # Mouth Corner Y relative to Mouth Top Y.
@@ -306,8 +322,8 @@ class StrictAUEstimator:
             avg = np.mean(arrays, axis=0)
             self.baseline = ActionUnits(
                 AU1=avg[0], AU2=avg[1], AU4=avg[2], AU5=avg[3], AU6=avg[4],
-                AU9=avg[5], AU12=avg[6], AU15=avg[7], AU20=avg[8], AU26=avg[9],
-                GAZE_X=avg[10], GAZE_Y=avg[11], AU_FOREHEAD=avg[12]
+                AU9=avg[5], AU10=avg[6], AU12=avg[7], AU15=avg[8], AU20=avg[9], 
+                AU26=avg[10], GAZE_X=avg[11], GAZE_Y=avg[12], AU_FOREHEAD=avg[13]
             )
         
         self.calibrated = True
@@ -339,25 +355,29 @@ class StrictAUEstimator:
         # AU2: Outer Brow Raise
         rel.AU2 = norm(current.AU2 - b.AU2, 0.05)
         
-        # AU4: Frown (Smaller Width = Frown) -> Baseline > Current
+        # AU4: Frown (Smaller Width + Larger Drop = Frown) -> Baseline > Current?
+        # Check math in compute():
+        # AU4 = (width + procerus * 1.5).
+        # Frown -> Width shrinks, Procerus shrinks.
+        # So Baseline > Current.
         rel.AU4 = norm(b.AU4 - current.AU4, 0.04)
         
         # AU5: Lid Raise (Larger Open = Raise)
         rel.AU5 = norm(current.AU5 - b.AU5, 0.02)
         
-        # AU6: Cheek Raise (Higher Cheek = Less Negative Y Diff? My math was -((...)). )
-        # I did -((cheek - eye)). Cheek > Eye. Diff is positive.
-        # Wait, Y increases down. Cheek > Eye. Cheek - Eye is Positive.
-        # Raise: Cheek moves UP (smaller Y). Cheek - Eye becomes SMALLER.
-        # Negation: -Small > -Big. So value INCREASES.
+        # AU6: Cheek Raise 
+        # Metric is negative. Raise = More positive (closer to 0).
+        # Diff = Current - Baseline.
         rel.AU6 = norm(current.AU6 - b.AU6, 0.03)
 
-        # AU9: Nose Wrinkle (Smaller Width?)
-        # Wrinkle pulls wings up/together. Width decreases? Or Scrunch?
-        # Usually vertical scrunch.
-        # Let's assume Width decreases or vertical distance decreases.
-        # For now, use deviation magnitude.
-        rel.AU9 = norm(abs(current.AU9 - b.AU9), 0.03)
+        # AU9: Nose Wrinkle (Smaller Width)
+        # Metric = Width. Wrinkle = Smaller width.
+        # Baseline > Current.
+        rel.AU9 = norm(b.AU9 - current.AU9, 0.03)
+
+        # AU10: Snarl (Upper Lip Rises -> Distance to Nose Shrinks)
+        # Baseline (Neutral) > Current (Snarl).
+        rel.AU10 = norm(b.AU10 - current.AU10, 0.03)
         
         # AU12: Smile (Corners UP -> Smaller Y dist to Nose Root)
         # Baseline Dist > Current Dist
@@ -368,7 +388,8 @@ class StrictAUEstimator:
         rel.AU15 = norm(current.AU15 - b.AU15, 0.04)
         
         # AU20: Lip Stretch (Wider Mouth)
-        rel.AU20 = norm(current.AU20 - b.AU20, 0.10)
+        # Current > Baseline
+        rel.AU20 = norm(current.AU20 - b.AU20, 0.08)
         
         # AU26: Jaw Drop (Larger Dist)
         rel.AU26 = norm(current.AU26 - b.AU26, 0.08)

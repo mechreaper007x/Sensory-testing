@@ -1,17 +1,14 @@
 """
-Protocol Senses v2 - Micro-Expression Detection System
+Protocol Senses v2 - Q-Learning Edition
+========================================
+Modified to use Q-Learning for adaptive sensitivity tuning.
+Merged with Behavioral Analysis Module.
 
-Integrates:
-- MediaPipe Face Mesh (478 landmarks)
-- Action Unit Estimation (10 AUs from geometry)
-- Flash Detector (temporal micro-expression detection)
-- Emotion Classifier (FER+ model with GPU acceleration)
-
-Controls:
-- 'q': Quit
-- 'r': Recalibrate
-- 'm': Toggle micro-expression mode (AU/Flash vs basic)
-- 'd': Toggle debug output
+Changes from original:
+- Replaced gradient descent with Q-Learning agent
+- Added policy visualization
+- Enhanced status display with Q-Learning metrics
+- Integrated Behavioral Analysis (Chewing, Scratching Zones)
 """
 
 import cv2
@@ -20,6 +17,7 @@ import urllib.request
 import os
 import time
 import concurrent.futures
+from collections import deque
 
 # MediaPipe Tasks imports
 from mediapipe.tasks import python as mp_python
@@ -30,17 +28,17 @@ from mediapipe import Image, ImageFormat
 from action_units_v2 import StrictAUEstimator as AUEstimator, ActionUnits
 from flash_detector import FlashDetector, FlashEvent, classify_emotion_from_aus
 from emotion_classifier import EmotionClassifier, crop_face_from_landmarks
-from rl_agent import SensitivityAgent
+from rl_agent import QLearningThresholdAgent
+from facs_decoder import FACSDecoder  # [NEW] Vector Decoder
 from camera_utils import ThreadedCamera
-
 
 
 # --- CONFIGURATION ---
 DROIDCAM_INDEX = 0
 HAND_FACE_THRESHOLD = 0.15
-DEBUG_MODE = False  # Terminal output
-MICRO_MODE = True   # Enable micro-expression detection
-USE_CNN_CLASSIFIER = True # Enable AffectNet Deep Learning Model
+DEBUG_MODE = False
+MICRO_MODE = True
+USE_CNN_CLASSIFIER = True
 
 # --- MODEL PATHS ---
 FACE_MODEL_PATH = "face_landmarker.task"
@@ -76,7 +74,6 @@ def draw_au_bars(frame, aus: ActionUnits, x=10, y=60):
         
         # Fill based on value
         fill_width = int(value * bar_width)
-        # Green for neutral/low (up to 0.65), Yellow for medium, Red for high
         color = (0, 255, 0) if value < 0.65 else (0, 255, 255) if value < 0.85 else (0, 0, 255)
         cv2.rectangle(frame, (x, y_pos), (x + fill_width, y_pos + bar_height), color, -1)
         
@@ -97,7 +94,6 @@ def draw_flash_indicator(frame, is_flashing: bool, flash_event: FlashEvent = Non
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
     
     if flash_event and emotion:
-        # Show detected emotion with confidence (no emoji - OpenCV Unicode issues)
         conf_pct = int(confidence * 100)
         text = f"Flash: {emotion.upper()} ({conf_pct}% conf, {flash_event.duration_ms:.0f}ms)"
         cv2.putText(frame, text, (w//2 - 150, h - 40), 
@@ -170,17 +166,35 @@ def main():
     au_estimator = AUEstimator(smoothing_factor=0.7)
     flash_detector = FlashDetector(
         baseline_frames=30,
-        deviation_threshold=2.0,
+        deviation_threshold=2.0,  # Will be dynamically adjusted by Q-Learning
         min_duration_ms=50,
         max_duration_ms=500,
         cooldown_ms=500
     )
     emotion_classifier = EmotionClassifier(use_gpu=True)
+    facs_decoder = FACSDecoder() # [NEW] Initialize Decoder
     
-    # Initialize RL Agent
-    rl_agent = SensitivityAgent(initial_threshold=2.0)
-    BRAIN_PATH = "brain.json"
-    rl_agent.load_state(BRAIN_PATH)
+    # Initialize Q-Learning Agent
+    print("\n" + "="*50)
+    print("INITIALIZING Q-LEARNING AGENT")
+    print("="*50)
+    rl_agent = QLearningThresholdAgent(
+        min_threshold=1.5,
+        max_threshold=4.0,
+        n_states=15,           # 15 discrete threshold levels
+        learning_rate=0.1,     # How fast to learn
+        discount_factor=0.9,   # Value future rewards at 90% of immediate
+        epsilon=0.4,           # Start with 40% exploration
+        epsilon_decay=0.995,   # Gradually reduce exploration
+        epsilon_min=0.05       # Always keep 5% exploration
+    )
+    
+    BRAIN_PATH = "brain_qlearning.json"
+    if rl_agent.load_state(BRAIN_PATH):
+        print("Continuing from previous training session.")
+    else:
+        print("Starting fresh training session.")
+    print("="*50 + "\n")
     
     # Initialize Async Executor for Classifier
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -220,7 +234,7 @@ def main():
     last_emotion = "neutral"
     last_flash_event = None
     last_confidence = 0.0
-
+    chew_buffer = deque(maxlen=60) # 2 seconds history for chewing detection
     
     with vision.FaceLandmarker.create_from_options(face_options) as face_landmarker, \
          vision.HandLandmarker.create_from_options(hand_options) as hand_landmarker:
@@ -232,8 +246,8 @@ def main():
             cv2.destroyAllWindows()
             return
         
-        print("--- PROTOCOL SENSES v2 ACTIVE ---")
-        print("Controls: 'q' quit | 'r' recalibrate | 'm' toggle micro-mode | 'd' debug")
+        print("--- PROTOCOL SENSES v2 - Q-LEARNING MODE ---")
+        print("Controls: 'q' quit | 'r' recalibrate | 'm' toggle micro-mode | 'd' debug | 'p' print policy")
         
         # Main Loop
         while True:
@@ -260,9 +274,7 @@ def main():
                 
                 if MICRO_MODE:
                     # === MICRO-EXPRESSION DETECTION ===
-                    # Raw AUs for flash detection (needs absolute values)
                     current_aus = au_estimator.compute(landmarks)
-                    # Relative AUs for display (0.5 = YOUR baseline)
                     display_aus = au_estimator.compute_relative(landmarks)
                     
                     is_flashing, flash_event = flash_detector.detect(current_aus)
@@ -272,8 +284,6 @@ def main():
                         
                     if is_flashing:
                         # === ASYNC CLASSIFIER LOGIC ===
-                        
-                        # 1. Check for completed task
                         result = None
                         if classifier_future and classifier_future.done():
                             try:
@@ -282,48 +292,52 @@ def main():
                                 if DEBUG_MODE: print(f"Classifier error: {e}")
                             classifier_future = None
                         
-                        # 2. Trigger new task if idle
                         if USE_CNN_CLASSIFIER and emotion_classifier.is_available() and classifier_future is None:
                             face_crop = crop_face_from_landmarks(frame, landmarks)
                             if face_crop is not None:
                                 classifier_future = executor.submit(emotion_classifier.classify, face_crop)
                         
-                        # 3. Fast Path (AU-Based) - Immediate Result
-                        au_emotion, au_conf = classify_emotion_from_aus(display_aus)
+                        # === EMOTION DECODING (FACS VECTOR) ===
+                        # Replaced Black Box CNN with Transparent Vector Math
+                        au_emotion, au_conf, all_scores = facs_decoder.decode(display_aus)
+
+                        # Integrate Results
+                        # We trust FACS Decoder more than the CNN now.
+                        # CNN is only used if explicitly enabled and high confidence.
                         
-                        # 4. Integrate Results
-                        # If async result just arrived, use it (with Override sync)
-                        if result:
-                            if result.confidence > 0.50:
-                                if result.emotion == 'neutral' and au_emotion != 'neutral' and au_conf > 0.4:
-                                    last_emotion = au_emotion
-                                    detected_confidence = au_conf
-                                else:
-                                    last_emotion = result.emotion
-                                    detected_confidence = result.confidence
-                            else:
-                                last_emotion = au_emotion
-                                detected_confidence = au_conf
+                        use_cnn_result = False
+                        if USE_CNN_CLASSIFIER and emotion_classifier.is_available() and result:
+                             if result.confidence > 0.85: # Only trust CNN if SUPER confident
+                                 use_cnn_result = True
+                        
+                        if use_cnn_result:
+                            last_emotion = result.emotion
+                            detected_confidence = result.confidence
+                        else:
+                            last_emotion = au_emotion
+                            detected_confidence = au_conf
                                 
-                            # Feed RL only on finished classification
-                            rl_result = (last_emotion, detected_confidence)
-                            new_threshold = rl_agent.update(rl_result, True)
-                            flash_detector.deviation_threshold = new_threshold
-                            
-                            if DEBUG_MODE:
-                                print(f"        [RL] Sensitivity tuned to: {new_threshold:.2f}")
+                        # === Q-LEARNING UPDATE ===
+                        rl_result = (last_emotion, detected_confidence)
+                        new_threshold = rl_agent.update(rl_result, True)
+                        flash_detector.deviation_threshold = new_threshold
+                        
+                        if DEBUG_MODE:
+                            print(f"\n[Q-LEARN] Flash detected!")
+                            print(f"  Emotion: {last_emotion} ({detected_confidence:.0%})")
+                            print(f"  New threshold: {new_threshold:.2f}")
+                            print(f"  Exploration rate: {rl_agent.epsilon:.3f}")
 
                         elif last_emotion == "neutral" or last_emotion == "":
-                            # While waiting for CNN, show AU estimation
                             last_emotion = au_emotion
                             detected_confidence = au_conf
 
-                        # (Visualization uses last_emotion continuously)
                         last_confidence = detected_confidence
-                        
-                        if DEBUG_MODE and result:
-                            print(f"\n[FLASH] Emotion: {last_emotion} ({detected_confidence:.0%}), Duration: {flash_event.duration_ms:.0f}ms")
-                            print(f"        Dominant AUs: {flash_event.dominant_aus}")
+                    
+                    # Non-flash updates (keep exploring)
+                    if not is_flashing and not flash_event:
+                        new_threshold = rl_agent.update(None, False)
+                        flash_detector.deviation_threshold = new_threshold
                     
                     # Draw AU bars
                     if display_aus:
@@ -331,22 +345,46 @@ def main():
                     
                     # Draw flash indicator
                     draw_flash_indicator(frame, is_flashing, last_flash_event, last_emotion, last_confidence)
-                    
-                    # RL Decay (Exploration)
-                    # If not flashing and no event just happened, slowly increase sensitivity
-                    if not is_flashing and not flash_event and MICRO_MODE:
-                        d_threshold = rl_agent.decay()
-                        flash_detector.deviation_threshold = d_threshold
                 
-                # === FACE TOUCHING (always active) ===
+                # === BEHAVIOR ANALYSIS ===
+                
+                # 1. Chewing Detection
+                if current_aus:
+                    chew_buffer.append(current_aus.AU26)
+                    if len(chew_buffer) > 10:
+                        jaw_activity = np.var(list(chew_buffer))
+                        if jaw_activity > 0.02: 
+                            status_report.append("CHEWING/TALKING")
+
+                # 2. Hand-Face Interaction
                 nose = (landmarks[1].x, landmarks[1].y)
+                chin = (landmarks[152].x, landmarks[152].y)
+                
                 if hand_result.hand_landmarks:
                     for hand_landmarks in hand_result.hand_landmarks:
                         finger_tip = (hand_landmarks[8].x, hand_landmarks[8].y)
-                        dist = calculate_distance(nose, finger_tip)
-                        if dist < HAND_FACE_THRESHOLD:
-                            status_report.append("FACE_TOUCHING")
-                            break
+                        
+                        # Distance to Nose
+                        dist_nose = calculate_distance(nose, finger_tip)
+                        
+                        # Distance to Chin (for Neck check)
+                        dist_chin = calculate_distance(chin, finger_tip)
+                        
+                        # 1. Nose
+                        if dist_nose < 0.08:
+                            status_report.append("SCRATCHING NOSE")
+                        
+                        # 2. Chin (Direct contact) - High priority over Neck
+                        elif dist_chin < 0.06:
+                            status_report.append("SCRATCHING CHIN")
+                            
+                        # 3. Neck (Strictly Below Chin & Further away)
+                        elif finger_tip[1] > chin[1] and dist_chin < 0.40:
+                            status_report.append("SCRATCHING NECK")
+                            
+                        # 4. General Face
+                        elif dist_nose < HAND_FACE_THRESHOLD:
+                            status_report.append("FACE TOUCHING")
             
             # Display status
             h, w = frame.shape[:2]
@@ -356,13 +394,13 @@ def main():
                 cv2.putText(frame, status_text, (w - 250, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
             
             # Mode indicator
-            mode_text = "MICRO-EXPRESSION MODE" if MICRO_MODE else "BASIC MODE"
+            mode_text = "Q-LEARNING MODE" if MICRO_MODE else "BASIC MODE"
             cv2.putText(frame, mode_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
             
-            # RL Agent Status
+            # Q-Learning Agent Status
             if MICRO_MODE:
                 agent_status = rl_agent.get_status()
-                cv2.putText(frame, agent_status, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                cv2.putText(frame, agent_status, (10, h - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
             
             # FPS counter
             fps_frames += 1
@@ -374,16 +412,43 @@ def main():
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
             
             # Controls hint
-            cv2.putText(frame, "'q' quit | 'r' recal | 'm' mode | 'd' debug", (10, h - 10), 
+            cv2.putText(frame, "'q' quit | 'r' recal | 'm' mode | 'd' debug | 'p' policy", (10, h - 10), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+
+            # === UI: EMOTION SPECTRUM (Right Side) ===
+            # Show all vector scores transparently
+            if 'all_scores' in locals() and all_scores:
+                ui_y = 150
+                cv2.putText(frame, "VECTOR MATCH SCORES:", (w - 220, ui_y - 15), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                
+                # Sort by score desc
+                sorted_scores = sorted(all_scores.items(), key=lambda x: x[1], reverse=True)
+                
+                for emo, score in sorted_scores:
+                    # Label
+                    cv2.putText(frame, f"{emo[:3].upper()}", (w - 220, ui_y + 10), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                    
+                    # Bar
+                    bar_len = int(score * 150)
+                    color = (0, 255, 0) if emo == last_emotion else (100, 100, 100)
+                    if score > 0.8: color = (0, 255, 255) # High confidence
+                    if score < 0.1: bar_len = 2 # Minimum visibility
+                    
+                    cv2.rectangle(frame, (w - 180, ui_y), (w - 180 + bar_len, ui_y + 12), color, -1)
+                    cv2.putText(frame, f"{score:.2f}", (w - 180 + bar_len + 5, ui_y + 10), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                    
+                    ui_y += 25
             
-            cv2.imshow('Protocol Senses v2', frame)
+            cv2.imshow('Protocol Senses v2 - Q-Learning', frame)
             
             key = cv2.waitKey(5) & 0xFF
             if key == ord('q'):
-                print("\nWait! Saving Brain...")
+                print("\nSaving Q-Learning brain...")
                 rl_agent.save_state(BRAIN_PATH)
-                print("Brain Saved. Quitting.")
+                print("Brain saved. Quitting.")
                 break
             elif key == ord('r'):
                 print("\nRecalibrating...")
@@ -398,9 +463,20 @@ def main():
             elif key == ord('d'):
                 DEBUG_MODE = not DEBUG_MODE
                 print(f"Debug mode: {'ON' if DEBUG_MODE else 'OFF'}")
+            elif key == ord('p'):
+                # Print learned policy
+                rl_agent.print_policy()
     
     cap.release()
     cv2.destroyAllWindows()
+    
+    # Final statistics
+    print("\n" + "="*60)
+    print("SESSION COMPLETE")
+    print("="*60)
+    rl_agent.print_policy()
+    print("\nBest learned threshold:", rl_agent.get_best_threshold())
+    print("="*60)
 
 
 if __name__ == "__main__":
