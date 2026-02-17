@@ -14,8 +14,10 @@ Changes from original:
 import cv2
 import numpy as np
 import urllib.request
+import urllib.error
 import os
 import time
+import argparse
 import concurrent.futures
 from collections import deque
 
@@ -26,7 +28,7 @@ from mediapipe import Image, ImageFormat
 
 # Local modules
 from action_units_v2 import StrictAUEstimator as AUEstimator, ActionUnits
-from flash_detector import FlashDetector, FlashEvent, classify_emotion_from_aus
+from flash_detector import FlashDetector, FlashEvent
 from emotion_classifier import EmotionClassifier, crop_face_from_landmarks
 from rl_agent import QLearningThresholdAgent
 from facs_decoder import FACSDecoder  # [NEW] Vector Decoder
@@ -34,8 +36,30 @@ from camera_utils import ThreadedCamera
 
 
 # --- CONFIGURATION ---
-DROIDCAM_INDEX = 0
+# Camera settings
+DEFAULT_CAMERA_INDEX = 0  # Can be overridden via command-line argument
+
+# Hand-Face Interaction thresholds
 HAND_FACE_THRESHOLD = 0.15
+NOSE_SCRATCH_THRESHOLD = 0.08
+CHIN_SCRATCH_THRESHOLD = 0.06
+NECK_SCRATCH_THRESHOLD = 0.40
+
+# Flash Detection settings
+BASELINE_FRAMES = 30
+DEFAULT_DEVIATION_THRESHOLD = 2.0
+MIN_FLASH_DURATION_MS = 50
+MAX_FLASH_DURATION_MS = 500
+FLASH_COOLDOWN_MS = 500
+
+# Chewing Detection
+CHEW_BUFFER_SIZE = 60
+CHEW_ACTIVITY_THRESHOLD = 0.02
+
+# AU Estimator
+SMOOTHING_FACTOR = 0.7
+
+# Mode flags
 DEBUG_MODE = False
 MICRO_MODE = True
 USE_CNN_CLASSIFIER = True
@@ -48,12 +72,47 @@ FACE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/face_landmarke
 HAND_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
 
 
-def download_model(url, path):
-    """Download model if not present"""
-    if not os.path.exists(path):
-        print(f"Downloading {path}...")
-        urllib.request.urlretrieve(url, path)
-        print(f"Downloaded {path}")
+def download_model(url, path, max_retries=3, timeout=30):
+    """Download model with error handling and retries."""
+    if os.path.exists(path):
+        # Verify existing file is valid
+        if os.path.getsize(path) > 0:
+            return True
+        else:
+            print(f"Existing {path} is empty, re-downloading...")
+            os.remove(path)
+    
+    print(f"Downloading {path}...")
+    for attempt in range(max_retries):
+        try:
+            def progress_hook(count, block_size, total_size):
+                if total_size > 0:
+                    percent = int(count * block_size * 100 / total_size)
+                    print(f"\rProgress: {percent}%", end='', flush=True)
+            
+            urllib.request.urlretrieve(url, path, progress_hook)
+            print(f"\nDownloaded {path}")
+            
+            # Validate downloaded file
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"Downloaded file not found: {path}")
+            if os.path.getsize(path) == 0:
+                raise ValueError(f"Downloaded file is empty: {path}")
+            
+            return True
+        except urllib.error.URLError as e:
+            print(f"\nAttempt {attempt + 1} failed: {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2)  # Wait before retry
+        except Exception as e:
+            print(f"\nUnexpected error: {e}")
+            if os.path.exists(path):
+                os.remove(path)  # Remove partial download
+            if attempt < max_retries - 1:
+                time.sleep(2)
+    
+    print(f"Failed to download {path} after {max_retries} attempts")
+    return False
 
 
 def calculate_distance(p1, p2):
@@ -158,18 +217,43 @@ def run_calibration(cap, face_landmarker, au_estimator, start_timestamp=0):
 def main():
     global DEBUG_MODE, MICRO_MODE
     
-    # Download models
-    download_model(FACE_MODEL_URL, FACE_MODEL_PATH)
-    download_model(HAND_MODEL_URL, HAND_MODEL_PATH)
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description='Protocol Senses v2 - Q-Learning Edition')
+    parser.add_argument('--camera', type=int, default=None,
+                       help='Camera index (default: 0, or from CAMERA_INDEX env var)')
+    args = parser.parse_args()
+    
+    # Determine camera index (command-line > environment variable > default)
+    camera_index = args.camera
+    if camera_index is None:
+        camera_index = int(os.getenv('CAMERA_INDEX', DEFAULT_CAMERA_INDEX))
+    
+    # Download models with validation
+    print("Checking for required model files...")
+    if not download_model(FACE_MODEL_URL, FACE_MODEL_PATH):
+        print("Error: Could not download face model. Exiting.")
+        return
+    
+    if not os.path.exists(FACE_MODEL_PATH):
+        print("Error: Face model file not found. Exiting.")
+        return
+    
+    if not download_model(HAND_MODEL_URL, HAND_MODEL_PATH):
+        print("Error: Could not download hand model. Exiting.")
+        return
+    
+    if not os.path.exists(HAND_MODEL_PATH):
+        print("Error: Hand model file not found. Exiting.")
+        return
     
     # Initialize modules
-    au_estimator = AUEstimator(smoothing_factor=0.7)
+    au_estimator = AUEstimator(smoothing_factor=SMOOTHING_FACTOR)
     flash_detector = FlashDetector(
-        baseline_frames=30,
-        deviation_threshold=2.0,  # Will be dynamically adjusted by Q-Learning
-        min_duration_ms=50,
-        max_duration_ms=500,
-        cooldown_ms=500
+        baseline_frames=BASELINE_FRAMES,
+        deviation_threshold=DEFAULT_DEVIATION_THRESHOLD,  # Will be dynamically adjusted by Q-Learning
+        min_duration_ms=MIN_FLASH_DURATION_MS,
+        max_duration_ms=MAX_FLASH_DURATION_MS,
+        cooldown_ms=FLASH_COOLDOWN_MS
     )
     emotion_classifier = EmotionClassifier(use_gpu=True)
     facs_decoder = FACSDecoder() # [NEW] Initialize Decoder
@@ -196,10 +280,10 @@ def main():
         print("Starting fresh training session.")
     print("="*50 + "\n")
     
-    # Initialize Async Executor for Classifier
+    # Initialize Async Executor for Classifier (with proper cleanup)
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     classifier_future = None
-            
+    
     # Create MediaPipe options
     face_options = vision.FaceLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=FACE_MODEL_PATH),
@@ -217,10 +301,15 @@ def main():
         min_tracking_confidence=0.5
     )
     
-    print("Starting Threaded Camera...")
-    cap = ThreadedCamera(DROIDCAM_INDEX)
+    print(f"Starting Threaded Camera (index: {camera_index})...")
+    cap = ThreadedCamera(camera_index)
     if not cap.isOpened():
         print("Error: Could not open camera.")
+        print("Please check:")
+        print("  1. Camera is connected")
+        print("  2. No other application is using the camera")
+        print("  3. Camera drivers are installed")
+        print(f"  4. Try different camera index with --camera flag (current: {camera_index})")
         return
     
     frame_timestamp = 0
@@ -234,43 +323,47 @@ def main():
     last_emotion = "neutral"
     last_flash_event = None
     last_confidence = 0.0
-    chew_buffer = deque(maxlen=60) # 2 seconds history for chewing detection
+    chew_buffer = deque(maxlen=CHEW_BUFFER_SIZE)  # 2 seconds history for chewing detection
     
-    with vision.FaceLandmarker.create_from_options(face_options) as face_landmarker, \
-         vision.HandLandmarker.create_from_options(hand_options) as hand_landmarker:
-        
-        # Run calibration
-        success, frame_timestamp = run_calibration(cap, face_landmarker, au_estimator, frame_timestamp)
-        if not success:
-            cap.release()
-            cv2.destroyAllWindows()
-            return
-        
-        print("--- PROTOCOL SENSES v2 - Q-LEARNING MODE ---")
-        print("Controls: 'q' quit | 'r' recalibrate | 'm' toggle micro-mode | 'd' debug | 'p' print policy")
-        
-        # Main Loop
-        while True:
-            frame = cap.read()
-            if frame is None:
-                print("Ignoring empty camera frame.")
-                continue
+    try:
+        with vision.FaceLandmarker.create_from_options(face_options) as face_landmarker, \
+             vision.HandLandmarker.create_from_options(hand_options) as hand_landmarker:
             
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = Image(image_format=ImageFormat.SRGB, data=rgb_frame)
-            frame_timestamp += 33
+            # Run calibration
+            success, frame_timestamp = run_calibration(cap, face_landmarker, au_estimator, frame_timestamp)
+            if not success:
+                cap.release()
+                cv2.destroyAllWindows()
+                return
             
-            # Detect face and hands
-            face_result = face_landmarker.detect_for_video(mp_image, frame_timestamp)
-            hand_result = hand_landmarker.detect_for_video(mp_image, frame_timestamp)
+            print("--- PROTOCOL SENSES v2 - Q-LEARNING MODE ---")
+            print("Controls: 'q' quit | 'r' recalibrate | 'm' toggle micro-mode | 'd' debug | 'p' print policy")
             
-            status_report = []
-            is_flashing = False
-            flash_event = None
-            current_aus = None
-            
-            if face_result.face_landmarks:
-                landmarks = face_result.face_landmarks[0]
+            # Main Loop
+            while True:
+                frame = cap.read()
+                if frame is None:
+                    print("Ignoring empty camera frame.")
+                    continue
+                
+                # Initialize all_scores for this iteration to avoid stale data
+                all_scores = {}
+                
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_image = Image(image_format=ImageFormat.SRGB, data=rgb_frame)
+                frame_timestamp += 33
+                
+                # Detect face and hands
+                face_result = face_landmarker.detect_for_video(mp_image, frame_timestamp)
+                hand_result = hand_landmarker.detect_for_video(mp_image, frame_timestamp)
+                
+                status_report = []
+                is_flashing = False
+                flash_event = None
+                current_aus = None
+                
+                if face_result.face_landmarks:
+                    landmarks = face_result.face_landmarks[0]
                 
                 if MICRO_MODE:
                     # === MICRO-EXPRESSION DETECTION ===
@@ -328,7 +421,8 @@ def main():
                             print(f"  New threshold: {new_threshold:.2f}")
                             print(f"  Exploration rate: {rl_agent.epsilon:.3f}")
 
-                        elif last_emotion == "neutral" or last_emotion == "":
+                        # Update emotion if it's neutral or empty (independent of DEBUG_MODE)
+                        if last_emotion == "neutral" or last_emotion == "":
                             last_emotion = au_emotion
                             detected_confidence = au_conf
 
@@ -353,7 +447,7 @@ def main():
                     chew_buffer.append(current_aus.AU26)
                     if len(chew_buffer) > 10:
                         jaw_activity = np.var(list(chew_buffer))
-                        if jaw_activity > 0.02: 
+                        if jaw_activity > CHEW_ACTIVITY_THRESHOLD: 
                             status_report.append("CHEWING/TALKING")
 
                 # 2. Hand-Face Interaction
@@ -371,104 +465,107 @@ def main():
                         dist_chin = calculate_distance(chin, finger_tip)
                         
                         # 1. Nose
-                        if dist_nose < 0.08:
+                        if dist_nose < NOSE_SCRATCH_THRESHOLD:
                             status_report.append("SCRATCHING NOSE")
                         
                         # 2. Chin (Direct contact) - High priority over Neck
-                        elif dist_chin < 0.06:
+                        elif dist_chin < CHIN_SCRATCH_THRESHOLD:
                             status_report.append("SCRATCHING CHIN")
                             
                         # 3. Neck (Strictly Below Chin & Further away)
-                        elif finger_tip[1] > chin[1] and dist_chin < 0.40:
+                        elif finger_tip[1] > chin[1] and dist_chin < NECK_SCRATCH_THRESHOLD:
                             status_report.append("SCRATCHING NECK")
                             
                         # 4. General Face
                         elif dist_nose < HAND_FACE_THRESHOLD:
                             status_report.append("FACE TOUCHING")
-            
-            # Display status
-            h, w = frame.shape[:2]
-            
-            if status_report:
-                status_text = f"ALERT: {', '.join(set(status_report))}"
-                cv2.putText(frame, status_text, (w - 250, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-            
-            # Mode indicator
-            mode_text = "Q-LEARNING MODE" if MICRO_MODE else "BASIC MODE"
-            cv2.putText(frame, mode_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-            
-            # Q-Learning Agent Status
-            if MICRO_MODE:
-                agent_status = rl_agent.get_status()
-                cv2.putText(frame, agent_status, (10, h - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
-            
-            # FPS counter
-            fps_frames += 1
-            if time.time() - fps_start >= 1.0:
-                current_fps = fps_frames
-                fps_frames = 0
-                fps_start = time.time()
-            cv2.putText(frame, f"FPS: {current_fps}", (w - 80, h - 10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-            
-            # Controls hint
-            cv2.putText(frame, "'q' quit | 'r' recal | 'm' mode | 'd' debug | 'p' policy", (10, h - 10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
+                
+                # Display status
+                h, w = frame.shape[:2]
+                
+                if status_report:
+                    status_text = f"ALERT: {', '.join(set(status_report))}"
+                    cv2.putText(frame, status_text, (w - 250, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                
+                # Mode indicator
+                mode_text = "Q-LEARNING MODE" if MICRO_MODE else "BASIC MODE"
+                cv2.putText(frame, mode_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                
+                # Q-Learning Agent Status
+                if MICRO_MODE:
+                    agent_status = rl_agent.get_status()
+                    cv2.putText(frame, agent_status, (10, h - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+                
+                # FPS counter
+                fps_frames += 1
+                if time.time() - fps_start >= 1.0:
+                    current_fps = fps_frames
+                    fps_frames = 0
+                    fps_start = time.time()
+                cv2.putText(frame, f"FPS: {current_fps}", (w - 80, h - 10), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                
+                # Controls hint
+                cv2.putText(frame, "'q' quit | 'r' recal | 'm' mode | 'd' debug | 'p' policy", (10, h - 10), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
 
-            # === UI: EMOTION SPECTRUM (Right Side) ===
-            # Show all vector scores transparently
-            if 'all_scores' in locals() and all_scores:
-                ui_y = 150
-                cv2.putText(frame, "VECTOR MATCH SCORES:", (w - 220, ui_y - 15), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                # === UI: EMOTION SPECTRUM (Right Side) ===
+                # Show all vector scores transparently
+                if all_scores:
+                    ui_y = 150
+                    cv2.putText(frame, "VECTOR MATCH SCORES:", (w - 220, ui_y - 15), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    
+                    # Sort by score desc
+                    sorted_scores = sorted(all_scores.items(), key=lambda x: x[1], reverse=True)
+                    
+                    for emo, score in sorted_scores:
+                        # Label
+                        cv2.putText(frame, f"{emo[:3].upper()}", (w - 220, ui_y + 10), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                        
+                        # Bar
+                        bar_len = int(score * 150)
+                        color = (0, 255, 0) if emo == last_emotion else (100, 100, 100)
+                        if score > 0.8: color = (0, 255, 255) # High confidence
+                        if score < 0.1: bar_len = 2 # Minimum visibility
+                        
+                        cv2.rectangle(frame, (w - 180, ui_y), (w - 180 + bar_len, ui_y + 12), color, -1)
+                        cv2.putText(frame, f"{score:.2f}", (w - 180 + bar_len + 5, ui_y + 10), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                        
+                        ui_y += 25
                 
-                # Sort by score desc
-                sorted_scores = sorted(all_scores.items(), key=lambda x: x[1], reverse=True)
+                cv2.imshow('Protocol Senses v2 - Q-Learning', frame)
                 
-                for emo, score in sorted_scores:
-                    # Label
-                    cv2.putText(frame, f"{emo[:3].upper()}", (w - 220, ui_y + 10), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-                    
-                    # Bar
-                    bar_len = int(score * 150)
-                    color = (0, 255, 0) if emo == last_emotion else (100, 100, 100)
-                    if score > 0.8: color = (0, 255, 255) # High confidence
-                    if score < 0.1: bar_len = 2 # Minimum visibility
-                    
-                    cv2.rectangle(frame, (w - 180, ui_y), (w - 180 + bar_len, ui_y + 12), color, -1)
-                    cv2.putText(frame, f"{score:.2f}", (w - 180 + bar_len + 5, ui_y + 10), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-                    
-                    ui_y += 25
-            
-            cv2.imshow('Protocol Senses v2 - Q-Learning', frame)
-            
-            key = cv2.waitKey(5) & 0xFF
-            if key == ord('q'):
-                print("\nSaving Q-Learning brain...")
-                rl_agent.save_state(BRAIN_PATH)
-                print("Brain saved. Quitting.")
-                break
-            elif key == ord('r'):
-                print("\nRecalibrating...")
-                au_estimator = AUEstimator()
-                flash_detector.reset()
-                success, frame_timestamp = run_calibration(cap, face_landmarker, au_estimator, frame_timestamp)
-                if not success:
+                key = cv2.waitKey(5) & 0xFF
+                if key == ord('q'):
+                    print("\nSaving Q-Learning brain...")
+                    rl_agent.save_state(BRAIN_PATH)
+                    print("Brain saved. Quitting.")
                     break
-            elif key == ord('m'):
-                MICRO_MODE = not MICRO_MODE
-                print(f"Micro-expression mode: {'ON' if MICRO_MODE else 'OFF'}")
-            elif key == ord('d'):
-                DEBUG_MODE = not DEBUG_MODE
-                print(f"Debug mode: {'ON' if DEBUG_MODE else 'OFF'}")
-            elif key == ord('p'):
-                # Print learned policy
-                rl_agent.print_policy()
-    
-    cap.release()
-    cv2.destroyAllWindows()
+                elif key == ord('r'):
+                    print("\nRecalibrating...")
+                    au_estimator = AUEstimator(smoothing_factor=SMOOTHING_FACTOR)
+                    flash_detector.reset()
+                    success, frame_timestamp = run_calibration(cap, face_landmarker, au_estimator, frame_timestamp)
+                    if not success:
+                        break
+                elif key == ord('m'):
+                    MICRO_MODE = not MICRO_MODE
+                    print(f"Micro-expression mode: {'ON' if MICRO_MODE else 'OFF'}")
+                elif key == ord('d'):
+                    DEBUG_MODE = not DEBUG_MODE
+                    print(f"Debug mode: {'ON' if DEBUG_MODE else 'OFF'}")
+                elif key == ord('p'):
+                    # Print learned policy
+                    rl_agent.print_policy()
+        # End of with statement for MediaPipe
+    finally:
+        # Cleanup ThreadPoolExecutor
+        executor.shutdown(wait=True)
+        cap.release()
+        cv2.destroyAllWindows()
     
     # Final statistics
     print("\n" + "="*60)

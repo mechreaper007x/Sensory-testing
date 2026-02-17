@@ -67,14 +67,28 @@ class EmotionClassifier:
                 print(f"Error downloading model: {e}")
                 return
 
-        # Initialize ONNX Runtime
+        # Initialize ONNX Runtime with fallback
+        providers = []
+        if use_gpu:
+            try:
+                # Try GPU first
+                providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+            except:
+                # Fallback to CPU if GPU setup fails
+                providers = ['CPUExecutionProvider']
+                print("GPU not available, falling back to CPU")
+        else:
+            providers = ['CPUExecutionProvider']
+        
         try:
-            providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if use_gpu else ['CPUExecutionProvider']
             self.session = ort.InferenceSession(self.MODEL_PATH, providers=providers)
             self.input_name = self.session.get_inputs()[0].name
-            print(f"Emotion Classifier loaded (AffectNet/EfficientNet). Device: {ort.get_device()}")
+            device = ort.get_device()
+            print(f"Emotion Classifier loaded (AffectNet/EfficientNet). Device: {device}")
         except Exception as e:
             print(f"Failed to load Emotion Classifier: {e}")
+            print("Emotion classification will be disabled.")
+            self.session = None
 
     def is_available(self) -> bool:
         return self.session is not None
@@ -114,8 +128,11 @@ class EmotionClassifier:
             outputs = self.session.run(None, {self.input_name: input_tensor})
             scores = outputs[0][0]  # Raw logits or probabilities
             
-            # Softmax to get probabilities if model returns logits
-            probs = np.exp(scores) / np.sum(np.exp(scores))
+            # Softmax to get probabilities if model returns logits (with numerical stability)
+            # Subtract max for numerical stability to prevent overflow
+            exp_scores = np.exp(scores - np.max(scores))
+            sum_exp = np.sum(exp_scores)
+            probs = exp_scores / (sum_exp + 1e-10)  # Add small epsilon to prevent division by zero
             
             # Get best class
             best_idx = np.argmax(probs)

@@ -1,0 +1,12 @@
+# Optional Dependencies
+# These are required only for protocol_feat.py and protocol_feat_deep.py
+
+# Py-Feat (OpenFace 2.0 implementation)
+py-feat>=2.0.0
+
+# DeepFace (for protocol_feat_deep.py)
+deepface>=0.0.79
+
+# Supporting libraries
+pandas>=2.0.0
+scikit-learn>=1.3.0

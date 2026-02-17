@@ -5,6 +5,7 @@ Camera Utilities for High-Performance Capture
 import cv2
 import threading
 import time
+import copy
 
 class ThreadedCamera:
     """
@@ -24,6 +25,7 @@ class ThreadedCamera:
         
         (self.grabbed, self.frame) = self.stream.read()
         self.stopped = False
+        self.lock = threading.Lock()  # Lock for thread-safe frame access
         
         # Start background thread
         self.thread = threading.Thread(target=self.update, args=())
@@ -38,13 +40,15 @@ class ThreadedCamera:
             
             (grabbed, frame) = self.stream.read()
             if grabbed:
-                self.frame = frame
+                with self.lock:
+                    self.frame = frame
             else:
                 self.stopped = True
 
     def read(self):
-        """Return the most recent frame"""
-        return self.frame
+        """Return the most recent frame (thread-safe copy)"""
+        with self.lock:
+            return copy.copy(self.frame) if self.frame is not None else None
 
     def release(self):
         """Stop thread and release camera"""

@@ -1,0 +1,20 @@
+# Core Dependencies
+opencv-python>=4.8.0
+numpy>=1.24.0
+mediapipe>=0.10.0
+
+# Emotion Classification (choose one based on your hardware)
+# For GPU acceleration (NVIDIA GPU with CUDA):
+onnxruntime-gpu>=1.15.0
+# OR for CPU-only:
+# onnxruntime>=1.15.0
+
+# Visualization (for benchmark_rl.py)
+matplotlib>=3.7.0
+
+# Optional Dependencies (for protocol_feat.py and protocol_feat_deep.py)
+# Uncomment if you want to use these features:
+# py-feat>=2.0.0
+# deepface>=0.0.79
+# pandas>=2.0.0
+# scikit-learn>=1.3.0

@@ -129,13 +129,29 @@ class StrictAUEstimator:
         
         return pitch, yaw
 
+    def _validate_landmarks(self, landmarks, required_count=468):
+        """Validate landmarks array has required points."""
+        if landmarks is None:
+            return False
+        if len(landmarks) < required_count:
+            return False
+        return True
+
     def compute(self, landmarks) -> ActionUnits:
+        # Validate landmarks before processing
+        if not self._validate_landmarks(landmarks):
+            return ActionUnits()  # Return empty AUs if landmarks invalid
+        
         # 1. Smooth Landmarks (Exponential Moving Average)
         # For simplicity, we assume 'landmarks' is raw frame data
         # In a real pipeline, we'd store prev_landmarks and lerp
         
         # 2. Estimate Pose
-        pitch, yaw = self.compute_pose(landmarks)
+        try:
+            pitch, yaw = self.compute_pose(landmarks)
+        except (IndexError, AttributeError) as e:
+            # Return empty AUs if pose estimation fails
+            return ActionUnits()
         
         # 3. Get Key Points and Un-rotate them
         # We collect all critical points into a matrix for batch rotation
@@ -162,7 +178,12 @@ class StrictAUEstimator:
             LEFT_FOREHEAD_TOP, RIGHT_FOREHEAD_TOP
         ]
         
-        raw_points = np.array([self._get_vec(landmarks, i) for i in indices])
+        # Safely extract points with error handling
+        try:
+            raw_points = np.array([self._get_vec(landmarks, i) for i in indices])
+        except (IndexError, AttributeError) as e:
+            # Return empty AUs if landmark access fails
+            return ActionUnits()
         
         # Center points around Nose Root before rotation
         center = raw_points[2] # NOSE_ROOT
